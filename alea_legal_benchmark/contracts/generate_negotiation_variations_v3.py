@@ -11,6 +11,7 @@ v3 approach:
 - Focus on LLM-friendly structure that still captures reasoning
 """
 
+import asyncio
 import json
 import os
 import hashlib
@@ -312,7 +313,12 @@ def load_existing_hashes(output_file: Path) -> Set[str]:
 
 
 def generate_variations_for_clause(clause_data: dict, agent: Agent) -> dict:
-    """Generate variations with simplified reasoning."""
+    """Generate variations with simplified reasoning (sync wrapper)."""
+    return asyncio.run(generate_variations_for_clause_async(clause_data, agent))
+
+
+async def generate_variations_for_clause_async(clause_data: dict, agent: Agent) -> dict:
+    """Generate variations with simplified reasoning (async)."""
 
     prompt = f"""
 Analyze this clause and generate negotiation variations:
@@ -333,7 +339,7 @@ Analyze this clause and generate negotiation variations:
 Generate 2-4 variations with structured reasoning following the framework.
 """
 
-    result = agent.run_sync(prompt)
+    result = await agent.run(prompt)
 
     # Compute hash for deduplication
     clause_hash = compute_clause_hash(clause_data)
@@ -346,12 +352,133 @@ Generate 2-4 variations with structured reasoning following the framework.
     }
 
 
+async def process_clauses_async(
+    input_file: Path,
+    output_file: Path,
+    max_samples: int = None,
+    start_offset: int = 0,
+    resume: bool = True,
+    max_workers: int = 10,
+):
+    """
+    Process clauses in parallel with asyncio.
+
+    Args:
+        input_file: Input JSONL file with clauses
+        output_file: Output JSONL file for results
+        max_samples: Maximum number to process (None = all)
+        start_offset: Starting index in input
+        resume: If True, skip already-processed clauses (default: True)
+        max_workers: Maximum concurrent workers (default: 10)
+    """
+
+    agent = create_negotiation_agent_v3()
+
+    # Load input clauses
+    with open(input_file, "r") as f:
+        clauses = [json.loads(line) for line in f]
+
+    if start_offset > 0:
+        clauses = clauses[start_offset:]
+    if max_samples:
+        clauses = clauses[:max_samples]
+
+    print(f"Loaded {len(clauses)} clauses from input")
+
+    # Resume mode: load existing hashes to skip duplicates
+    existing_hashes = set()
+    if resume:
+        existing_hashes = load_existing_hashes(output_file)
+
+        if existing_hashes:
+            # Filter out already-processed clauses
+            original_count = len(clauses)
+            clauses = [
+                c for c in clauses if compute_clause_hash(c) not in existing_hashes
+            ]
+            skipped = original_count - len(clauses)
+            print(f"  ✅ Skipping {skipped} already-processed clauses")
+            print(f"  📊 Remaining to process: {len(clauses)}")
+
+    if not clauses:
+        print("\n✅ All clauses already processed!")
+        return
+
+    print(f"\nProcessing {len(clauses)} clauses (v3 - parallel mode)...")
+    print(f"Output: {output_file}")
+    print(f"Mode: {'APPEND (resume)' if resume else 'WRITE'}")
+    print(f"Workers: {max_workers}")
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    success_count = 0
+    fail_count = 0
+    skip_count = len(existing_hashes) if resume else 0
+
+    # Use append mode by default
+    mode = "a" if resume or output_file.exists() else "w"
+
+    # Semaphore for concurrency control
+    semaphore = asyncio.Semaphore(max_workers)
+
+    # Lock for file writes
+    write_lock = asyncio.Lock()
+
+    async def process_one(clause_data: dict):
+        """Process a single clause with semaphore control."""
+        nonlocal success_count, fail_count, skip_count
+
+        async with semaphore:
+            try:
+                # Double-check we're not duplicating
+                clause_hash = compute_clause_hash(clause_data)
+                if clause_hash in existing_hashes:
+                    async with write_lock:
+                        skip_count += 1
+                    return
+
+                result = await generate_variations_for_clause_async(clause_data, agent)
+
+                # Write to file (with lock for thread safety)
+                async with write_lock:
+                    with open(output_file, mode) as out_f:
+                        out_f.write(json.dumps(result) + "\n")
+                        out_f.flush()
+
+                    # Track this hash to avoid duplicates
+                    existing_hashes.add(clause_hash)
+                    success_count += 1
+
+            except Exception as e:
+                async with write_lock:
+                    fail_count += 1
+                    print(f"\nError: {e}")
+                    if hasattr(e, "args") and e.args:
+                        print(f"Details: {str(e.args[0])[:500]}")
+
+    # Create tasks with progress bar
+    tasks = [process_one(clause_data) for clause_data in clauses]
+
+    # Use tqdm for progress tracking
+    for coro in tqdm.tqdm(
+        asyncio.as_completed(tasks), total=len(tasks), desc="Generating"
+    ):
+        await coro
+
+    print("\nComplete!")
+    print(f"  ✅ Success: {success_count}")
+    print(f"  ❌ Failed: {fail_count}")
+    if skip_count > 0:
+        print(f"  ⏭️  Skipped (already processed): {skip_count}")
+
+
 def process_clauses(
     input_file: Path,
     output_file: Path,
     max_samples: int = None,
     start_offset: int = 0,
     resume: bool = True,
+    max_workers: int = None,
 ):
     """
     Process clauses with simplified reasoning.
@@ -362,8 +489,24 @@ def process_clauses(
         max_samples: Maximum number to process (None = all)
         start_offset: Starting index in input
         resume: If True, skip already-processed clauses (default: True)
+        max_workers: If set, use parallel processing (default: None = sequential)
     """
 
+    if max_workers:
+        # Use async parallel processing
+        asyncio.run(
+            process_clauses_async(
+                input_file=input_file,
+                output_file=output_file,
+                max_samples=max_samples,
+                start_offset=start_offset,
+                resume=resume,
+                max_workers=max_workers,
+            )
+        )
+        return
+
+    # Sequential processing (original code)
     agent = create_negotiation_agent_v3()
 
     # Load input clauses
@@ -445,7 +588,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate negotiation variations with resume support"
+        description="Generate negotiation variations with resume support and parallel processing"
     )
     parser.add_argument(
         "--max-samples", type=int, default=None, help="Max samples (None = all)"
@@ -456,6 +599,12 @@ def main():
         "--no-resume",
         action="store_true",
         help="Disable resume mode (overwrite output file)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Enable parallel processing with N workers (default: None = sequential)",
     )
     args = parser.parse_args()
 
@@ -483,6 +632,7 @@ def main():
         max_samples=args.max_samples,
         start_offset=args.start_offset,
         resume=not args.no_resume,
+        max_workers=args.max_workers,
     )
 
 
