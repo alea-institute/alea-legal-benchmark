@@ -80,7 +80,7 @@ def generate_samples(
     )
     output_file_path.mkdir(parents=True, exist_ok=True)
     output_file_name = (
-        f"sample_{datetime.datetime.now().isoformat().replace(":", "")}.jsonl"
+        f"sample_{datetime.datetime.now().isoformat().replace(':', '')}.jsonl"
     )
 
     # open file and output
