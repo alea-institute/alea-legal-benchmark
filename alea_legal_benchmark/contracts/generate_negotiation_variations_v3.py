@@ -13,8 +13,9 @@ v3 approach:
 
 import json
 import os
+import hashlib
 from pathlib import Path
-from typing import List
+from typing import List, Set
 from datetime import datetime, UTC
 
 from pydantic import BaseModel, Field
@@ -258,6 +259,58 @@ def select_observer_context(clause_data: dict) -> str:
     return f"Observer options: {', '.join(hints)}"
 
 
+def compute_clause_hash(clause_data: dict) -> str:
+    """
+    Compute a unique hash for a clause based on its content.
+
+    Uses blake2b for fast hashing of clause text + metadata.
+    """
+    # Create a stable string representation
+    hash_input = f"{clause_data.get('clause', '')}"
+    hash_input += f"|{clause_data.get('date', '')}"
+    hash_input += f"|{clause_data.get('area_of_law', '')}"
+    hash_input += f"|{clause_data.get('location', '')}"
+    hash_input += f"|{clause_data.get('industry', '')}"
+    hash_input += f"|{clause_data.get('clause_type', '')}"
+
+    return hashlib.blake2b(hash_input.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def load_existing_hashes(output_file: Path) -> Set[str]:
+    """
+    Load hashes of already-processed clauses from existing output file.
+
+    Returns:
+        Set of clause hashes that have already been processed
+    """
+    existing_hashes = set()
+
+    if not output_file.exists():
+        return existing_hashes
+
+    print(f"Loading existing records from {output_file}...")
+    try:
+        with open(output_file, "r") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    clause_data = record.get("original_clause_data", {})
+                    clause_hash = compute_clause_hash(clause_data)
+                    existing_hashes.add(clause_hash)
+                except json.JSONDecodeError:
+                    print(f"  ⚠️  Skipping malformed line {line_num}")
+                    continue
+    except Exception as e:
+        print(f"  ⚠️  Error loading existing file: {e}")
+        return set()
+
+    print(f"  ✅ Loaded {len(existing_hashes)} existing records")
+    return existing_hashes
+
+
 def generate_variations_for_clause(clause_data: dict, agent: Agent) -> dict:
     """Generate variations with simplified reasoning."""
 
@@ -282,7 +335,11 @@ Generate 2-4 variations with structured reasoning following the framework.
 
     result = agent.run_sync(prompt)
 
+    # Compute hash for deduplication
+    clause_hash = compute_clause_hash(clause_data)
+
     return {
+        "clause_hash": clause_hash,
         "original_clause_data": clause_data,
         "negotiation_analysis": result.output.model_dump(),
         "timestamp": datetime.now(UTC).isoformat(),
@@ -294,11 +351,22 @@ def process_clauses(
     output_file: Path,
     max_samples: int = None,
     start_offset: int = 0,
+    resume: bool = True,
 ):
-    """Process clauses with simplified reasoning."""
+    """
+    Process clauses with simplified reasoning.
+
+    Args:
+        input_file: Input JSONL file with clauses
+        output_file: Output JSONL file for results
+        max_samples: Maximum number to process (None = all)
+        start_offset: Starting index in input
+        resume: If True, skip already-processed clauses (default: True)
+    """
 
     agent = create_negotiation_agent_v3()
 
+    # Load input clauses
     with open(input_file, "r") as f:
         clauses = [json.loads(line) for line in f]
 
@@ -307,21 +375,57 @@ def process_clauses(
     if max_samples:
         clauses = clauses[:max_samples]
 
-    print(f"Processing {len(clauses)} clauses (v3 - simplified schema)...")
+    print(f"Loaded {len(clauses)} clauses from input")
+
+    # Resume mode: load existing hashes to skip duplicates
+    existing_hashes = set()
+    if resume:
+        existing_hashes = load_existing_hashes(output_file)
+
+        if existing_hashes:
+            # Filter out already-processed clauses
+            original_count = len(clauses)
+            clauses = [
+                c for c in clauses if compute_clause_hash(c) not in existing_hashes
+            ]
+            skipped = original_count - len(clauses)
+            print(f"  ✅ Skipping {skipped} already-processed clauses")
+            print(f"  📊 Remaining to process: {len(clauses)}")
+
+    if not clauses:
+        print("\n✅ All clauses already processed!")
+        return
+
+    print(f"\nProcessing {len(clauses)} clauses (v3 - simplified schema)...")
     print(f"Output: {output_file}")
+    print(f"Mode: {'APPEND (resume)' if resume else 'WRITE'}")
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
     fail_count = 0
+    skip_count = len(existing_hashes) if resume else 0
 
-    with open(output_file, "w") as out_f:
+    # Use append mode by default
+    mode = "a" if resume or output_file.exists() else "w"
+
+    with open(output_file, mode) as out_f:
         for clause_data in tqdm.tqdm(clauses, desc="Generating"):
             try:
+                # Double-check we're not duplicating (in case of concurrent writes)
+                clause_hash = compute_clause_hash(clause_data)
+                if clause_hash in existing_hashes:
+                    skip_count += 1
+                    continue
+
                 result = generate_variations_for_clause(clause_data, agent)
                 out_f.write(json.dumps(result) + "\n")
                 out_f.flush()
+
+                # Track this hash to avoid duplicates in this session
+                existing_hashes.add(clause_hash)
                 success_count += 1
+
             except Exception as e:
                 print(f"\nError: {e}")
                 # Print first 500 chars for debugging
@@ -329,19 +433,30 @@ def process_clauses(
                     print(f"Details: {str(e.args[0])[:500]}")
                 fail_count += 1
 
-    print(f"\nComplete! Success: {success_count}, Failed: {fail_count}")
+    print("\nComplete!")
+    print(f"  ✅ Success: {success_count}")
+    print(f"  ❌ Failed: {fail_count}")
+    if skip_count > 0:
+        print(f"  ⏭️  Skipped (already processed): {skip_count}")
 
 
 def main():
     """Main entry."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate negotiation variations")
+    parser = argparse.ArgumentParser(
+        description="Generate negotiation variations with resume support"
+    )
     parser.add_argument(
         "--max-samples", type=int, default=None, help="Max samples (None = all)"
     )
     parser.add_argument("--start-offset", type=int, default=0, help="Starting index")
     parser.add_argument("--output-name", type=str, default=None, help="Output filename")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume mode (overwrite output file)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent.parent
@@ -367,6 +482,7 @@ def main():
         output_file=output_file,
         max_samples=args.max_samples,
         start_offset=args.start_offset,
+        resume=not args.no_resume,
     )
 
 
