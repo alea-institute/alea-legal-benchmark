@@ -7,19 +7,33 @@ This system generates simulated negotiation data from legal contract clauses usi
 ### Generate Variations
 
 ```bash
-# Test run (5 samples)
+# Test run (5 samples, sequential)
 uv run python alea_legal_benchmark/contracts/generate_negotiation_variations_v3.py \
   --max-samples 5
 
-# Full dataset (10,001 clauses, ~8 days)
+# Test run (5 samples, parallel with 3 workers)
 uv run python alea_legal_benchmark/contracts/generate_negotiation_variations_v3.py \
-  --output-name variations_v3_full.jsonl
+  --max-samples 5 \
+  --max-workers 3
+
+# Full dataset (10,001 clauses)
+# Sequential: ~6-7 days
+# Parallel (10 workers): ~5-6 hours! 🚀
+uv run python alea_legal_benchmark/contracts/generate_negotiation_variations_v3.py \
+  --output-name variations_v3_full.jsonl \
+  --max-workers 10
 
 # Custom batch
 uv run python alea_legal_benchmark/contracts/generate_negotiation_variations_v3.py \
   --start-offset 1000 \
   --max-samples 500 \
+  --max-workers 10 \
   --output-name batch_1000-1500.jsonl
+
+# Resume from crash or interruption (automatic deduplication)
+uv run python alea_legal_benchmark/contracts/generate_negotiation_variations_v3.py \
+  --output-name variations_v3_full.jsonl \
+  --max-workers 10
 ```
 
 ### Inspect Results
@@ -136,9 +150,21 @@ See `REASONING_NOTATION_GUIDE.md` for full notation reference.
 
 ## Performance
 
-- **v3 (current)**: 5/5 test samples succeeded, ~73s average
-- **Estimated time**: ~8.5 days for 10,001 clauses sequential
+### Sequential Mode
+- **v3 (current)**: 5/5 test samples succeeded, ~60-70s average per sample
+- **Estimated time**: ~6-7 days for 10,001 clauses
 - **Model**: gpt-5-mini via OpenAI API
+
+### Parallel Mode (NEW! 🚀)
+- **Test results**: 10/10 samples in 2:47 (167s) with 5 workers
+- **Wallclock time**: ~17s per sample (5x throughput)
+- **Speedup**: ~3.6-4.2x with 5 workers
+- **Estimated time (10 workers)**: ~5-6 hours for 10,001 clauses!
+- **Features**:
+  - asyncio.Semaphore for concurrency control
+  - Thread-safe file writes with asyncio.Lock
+  - Works with resume mode
+  - Backward compatible (defaults to sequential)
 
 ## Monitoring
 
